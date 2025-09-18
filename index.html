@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Pose Runner — Endless Runner com Teachable Machine</title>
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; display:flex; gap:20px; padding:20px; }
+    .col { display:flex; flex-direction:column; gap:10px; }
+    #controls { margin-bottom:8px; }
+    #gameCanvas { border:2px solid #222; background:#f0f0f0; }
+    #poseCanvas { border:1px dashed #999; }
+    #label-container div { font-size:13px; margin:2px 0; }
+    .small { font-size:13px; color:#444; }
+    #toggleWebcam { margin-left:8px; }
+  </style>
+</head>
+<body>
+  <div class="col" style="width:640px;">
+    <div id="controls">
+      <button id="startBtn">Start</button>
+      <button id="restartBtn" disabled>Reiniciar</button>
+      <label class="small"> Sensibilidade:
+        <input id="threshold" type="range" min="0.5" max="0.99" step="0.01" value="0.80">
+        <span id="thVal">0.80</span>
+      </label>
+      <label class="small"><input type="checkbox" id="showWebcam" checked> Mostrar webcam</label>
+    </div>
+
+    <canvas id="gameCanvas" width="800" height="250"></canvas>
+    <div class="small">Controles: levante o braço (ou a ação que você treinou como "pular") — ou pressione Espaço para pular.</div>
+    <div class="small">Modelo: coloque a pasta <code>my_model</code> ao lado deste HTML ou edite a variável <code>URL</code> no script.</div>
+  </div>
+
+  <div class="col" style="width:260px;">
+    <canvas id="poseCanvas" width="240" height="240"></canvas>
+    <div id="label-container"></div>
+    <div class="small" id="status">Status: parado</div>
+  </div>
+
+  <!-- TensorFlow.js e Teachable Machine Pose (versões compatíveis com o exemplo) -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@1.3.1/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/pose@0.8/dist/teachablemachine-pose.min.js"></script>
+
+  <script>
+  // ---------- CONFIG ----------
+  const URL = "./my_model/"; // <-- coloque seu model.json e metadata.json aqui
+  // Nome da classe que indica "pular" no seu modelo (mude se necessário)
+  const JUMP_CLASS_NAME = "pular";
+
+  // ---------- VARIÁVEIS DO MODELO & WEBCAM ----------
+  let model, maxPredictions;
+  let webcam; // tmPose.Webcam
+  let poseCtx, labelContainer, poseCanvas, thresholdSlider, thVal;
+  let showWebcamCheckbox;
+
+  // ---------- VARIÁVEIS DO JOGO ----------
+  const gameCanvas = document.getElementById("gameCanvas");
+  const ctx = gameCanvas.getContext("2d");
+  let running = false;
+  let score = 0;
+  let obstacles = [];
+  let frames = 0;
+  const gravity = 0.8;
+  const groundY = 200;
+
+  const player = {
+    x: 60,
+    y: groundY - 30,
+    width: 28,
+    height: 30,
+    vy: 0,
+    jumping: false,
+    color: "#0b76ff"
+  };
+
+  // ---------- INICIALIZAÇÃO UI ----------
+  const startBtn = document.getElementById("startBtn");
+  const restartBtn = document.getElementById("restartBtn");
+  const statusDiv = document.getElementById("status");
+  labelContainer = document.getElementById("label-container");
+  poseCanvas = document.getElementById("poseCanvas");
+  poseCtx = poseCanvas.getContext("2d");
+  thresholdSlider = document.getElementById("threshold");
+  thVal = document.getElementById("thVal");
+  showWebcamCheckbox = document.getElementById("showWebcam");
+
+  thresholdSlider.addEventListener("input", () => thVal.textContent = thresholdSlider.value);
+
+  startBtn.addEventListener("click", () => {
+    if (!running) start();
+  });
+
+  restartBtn.addEventListener("click", () => {
+    resetGame();
+    restartBtn.disabled = true;
+    startBtn.disabled = false;
+  });
+
+  // Espaço para pular como fallback
+  window.addEventListener("keydown", (e) => {
+    if (e.code === "Space") {
+      e.preventDefault();
+      triggerJump();
+    }
+  });
+
+  // ---------- FUNÇÕES DO JOGO ----------
+  function resetGame() {
+    obstacles = [];
+    score = 0;
+    frames = 0;
+    player.y = groundY - player.height;
+    player.vy = 0;
+    player.jumping = false;
+    running = false;
+    statusDiv.textContent = "Status: parado";
+    ctx.clearRect(0,0,gameCanvas.width,gameCanvas.height);
+  }
+
+  function triggerJump() {
+    if (!player.jumping) {
+      player.vy = -14;
+      player.jumping = true;
+    }
+  }
+
+  function spawnObstacle() {
+    // variação de tamanhos
+    const h = 20 + Math.floor(Math.random() * 30);
+    obstacles.push({
+      x: gameCanvas.width + 10,
+      y: groundY - h,
+      width: 18 + Math.floor(Math.random() * 20),
+      height: h,
+      color: "#c0392b"
+    });
+  }
+
+  function updateGame() {
+    // física do jogador
+    player.y += player.vy;
+    player.vy += gravity;
+    if (player.y > groundY - player.height) {
+      player.y = groundY - player.height;
+      player.vy = 0;
+      player.jumping = false;
+    }
+
+    // mover obstáculos
+    for (let i = obstacles.length - 1; i >= 0; i--) {
+      obstacles[i].x -= 6; // velocidade
+      if (obstacles[i].x + obstacles[i].width < 0) obstacles.splice(i,1);
+    }
+
+    // colisão simples AABB
+    for (const o of obstacles) {
+      if (player.x < o.x + o.width &&
+          player.x + player.width > o.x &&
+          player.y < o.y + o.height &&
+          player.y + player.height > o.y) {
+        // colisão -> game over
+        running = false;
+        statusDiv.textContent = "Status: Game Over";
+        restartBtn.disabled = false;
+        startBtn.disabled = true;
+        return;
+      }
+    }
+
+    frames++;
+    if (frames % 90 === 0) spawnObstacle(); // gera obstáculo a cada 90 frames (ajustável)
+    score = Math.floor(frames / 2);
+  }
+
+  function drawGame() {
+    // fundo
+    ctx.clearRect(0,0,gameCanvas.width,gameCanvas.height);
+    // céu
+    ctx.fillStyle = "#f7f7f7";
+    ctx.fillRect(0,0,gameCanvas.width,groundY+50);
+
+    // chão
+    ctx.fillStyle = "#2ecc71";
+    ctx.fillRect(0, groundY, gameCanvas.width, gameCanvas.height - groundY);
+
+    // player
+    ctx.fillStyle = player.color;
+    ctx.fillRect(player.x, player.y, player.width, player.height);
+
+    // obstáculos
+    for (const o of obstacles) {
+      ctx.fillStyle = o.color;
+      ctx.fillRect(o.x, o.y, o.width, o.height);
+    }
+
+    // score
+    ctx.fillStyle = "#222";
+    ctx.font = "18px Arial";
+    ctx.fillText("Score: " + score, gameCanvas.width - 130, 30);
+  }
+
+  // ---------- TEACHABLE MACHINE / PREDIÇÃO ----------
+  async function initModel() {
+    statusDiv.textContent = "Status: carregando modelo...";
+    const modelURL = URL + "model.json";
+    const metadataURL = URL + "metadata.json";
+    model = await tmPose.load(modelURL, metadataURL);
+    maxPredictions = model.getTotalClasses();
+
+    // criar elementos de label
+    labelContainer.innerHTML = "";
+    for (let i = 0; i < maxPredictions; i++) {
+      const d = document.createElement("div");
+      d.textContent = "Classe " + i;
+      labelContainer.appendChild(d);
+    }
+    statusDiv.textContent = "Status: modelo carregado";
+  }
+
+  async function initWebcam() {
+    showWebcamCheckbox.disabled = true;
+    statusDiv.textContent = "Status: inicializando webcam...";
+    webcam = new tmPose.Webcam(240, 240, true);
+    await webcam.setup(); // request access
+    await webcam.play();
+    window.requestAnimationFrame(poseLoop);
+    statusDiv.textContent = "Status: webcam ativa";
+  }
+
+  async function start() {
+    startBtn.disabled = true;
+    restartBtn.disabled = true;
+    try {
+      if (!model) await initModel();
+      if (!webcam) await initWebcam();
+      running = true;
+      statusDiv.textContent = "Status: jogando";
+      // iniciar loop do jogo
+      window.requestAnimationFrame(gameLoop);
+    } catch (err) {
+      console.error(err);
+      alert("Erro ao iniciar: " + err.message);
+      startBtn.disabled = false;
+    }
+  }
+
+  // Este loop cuida apenas da predição / pose (roda continuamente)
+  async function poseLoop() {
+    if (!webcam) return;
+    webcam.update();
+    // desenhar webcam (opcional)
+    if (showWebcamCheckbox.checked) {
+      poseCtx.clearRect(0,0,poseCanvas.width, poseCanvas.height);
+      poseCtx.drawImage(webcam.canvas, 0, 0, poseCanvas.width, poseCanvas.height);
+    } else {
+      poseCtx.clearRect(0,0,poseCanvas.width, poseCanvas.height);
+    }
+
+    // estimar pose & predizer classes
+    const { pose, posenetOutput } = await model.estimatePose(webcam.canvas);
+    const prediction = await model.predict(posenetOutput);
+
+    // atualizar labels
+    for (let i = 0; i < prediction.length; i++) {
+      const p = prediction[i];
+      labelContainer.childNodes[i].innerText = `${p.className}: ${p.probability.toFixed(2)}`;
+    }
+
+    // desenhar keypoints / skeleton apenas se mostrar webcam
+    if (pose && showWebcamCheckbox.checked) {
+      const minPartConfidence = 0.4;
+      tmPose.drawKeypoints(pose.keypoints, minPartConfidence, poseCtx);
+      tmPose.drawSkeleton(pose.keypoints, minPartConfidence, poseCtx);
+    }
+
+    // interpretar ação de pular
+    const threshold = parseFloat(thresholdSlider.value);
+    const jumpPrediction = prediction.find(p => p.className.toLowerCase() === JUMP_CLASS_NAME.toLowerCase());
+    if (jumpPrediction && jumpPrediction.probability > threshold) {
+      // dispara pulo
+      triggerJump();
+    }
+
+    if (webcam) window.requestAnimationFrame(poseLoop);
+  }
+
+  // Loop do jogo (render + update)
+  function gameLoop() {
+    if (!running) {
+      drawGame(); // desenha estado final
+      return;
+    }
+    updateGame();
+    drawGame();
+    window.requestAnimationFrame(gameLoop);
+  }
+
+  // Auto reset quando perder: re-enable botão reiniciar etc handled in updateGame
+
+  // Se usuário alterar exibir webcam, atualiza display imediatamente
+  showWebcamCheckbox.addEventListener("change", () => {
+    poseCanvas.style.display = showWebcamCheckbox.checked ? "block" : "none";
+  });
+
+  // Ao carregar a página, desliga canvas da webcam se necessário
+  if (!showWebcamCheckbox.checked) poseCanvas.style.display = "none";
+
+  // /////////////////
+  // Inicia com reset limpo
+  resetGame();
+  statusDiv.textContent = "Status: pronto";
+
+  // Nota: se quiser testar sem modelo, comente as chamadas do modelo e use o Espaço para pular.
+  </script>
+</body>
+</html>
